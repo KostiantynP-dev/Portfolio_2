@@ -6,6 +6,9 @@
 #include <cctype>
 #include <stdexcept>
 #include <map>
+#include <chrono>
+#include <thread>
+#include <random>
 
 // ---------------------------------------------------------------------------
 // Tile symbols (display)
@@ -22,6 +25,9 @@ namespace Tiles {
     const char STRENGTH_POTION = 'S';
     const char DEFENSE_POTION = 'G';
     const char HAZARD = '~';  // damaging floor (walkable; type from metadata)
+    const char SWITCH = '!';       // toggles all tiles with the same signal index
+    const char SWITCH_WALL_ED = '=';   // editor / blueprint: switch-controlled wall
+    const char SWITCH_HAZARD_ED = '%'; // editor: switch-controlled damaging floor
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +44,10 @@ enum class TileKind {
     HealthPotion,
     StrengthPotion,
     DefensePotion,
-    DamagingFloor
+    DamagingFloor,
+    Switch,
+    SwitchWall,
+    SwitchHazard
 };
 
 /** Global hazard type -> damage (all tiles of that type use the same damage). */
@@ -69,8 +78,11 @@ struct CellInstance {
     int potionBonus = 10;
     /** Damaging floor category; damage from hazardDamageForType. */
     std::string hazardType = "spikes";
+    /** Switch, SwitchWall, SwitchHazard: shared signal id (toggle state is per-id in Game). */
+    int switchSignal = 0;
 
-    char displayChar() const {
+    /** In-game display when switch group is powered (walls block, hazards hurt). */
+    char gameDisplayChar(bool signalPowered) const {
         switch (kind) {
         case TileKind::Empty: return Tiles::EMPTY;
         case TileKind::Wall: return Tiles::WALL;
@@ -83,9 +95,35 @@ struct CellInstance {
         case TileKind::StrengthPotion: return Tiles::STRENGTH_POTION;
         case TileKind::DefensePotion: return Tiles::DEFENSE_POTION;
         case TileKind::DamagingFloor: return Tiles::HAZARD;
+        case TileKind::Switch: return Tiles::SWITCH;
+        case TileKind::SwitchWall: return signalPowered ? Tiles::WALL : Tiles::EMPTY;
+        case TileKind::SwitchHazard: return signalPowered ? Tiles::HAZARD : Tiles::EMPTY;
         }
         return Tiles::EMPTY;
     }
+
+    /** Level editor always shows structural symbols (so you can see linked tiles). */
+    char editorDisplayChar() const {
+        switch (kind) {
+        case TileKind::Empty: return Tiles::EMPTY;
+        case TileKind::Wall: return Tiles::WALL;
+        case TileKind::PlayerSpawn: return Tiles::PLAYER;
+        case TileKind::Goal: return Tiles::GOAL;
+        case TileKind::Key: return Tiles::KEY;
+        case TileKind::Door: return Tiles::DOOR;
+        case TileKind::Enemy: return Tiles::ENEMY;
+        case TileKind::HealthPotion: return Tiles::HEALTH_POTION;
+        case TileKind::StrengthPotion: return Tiles::STRENGTH_POTION;
+        case TileKind::DefensePotion: return Tiles::DEFENSE_POTION;
+        case TileKind::DamagingFloor: return Tiles::HAZARD;
+        case TileKind::Switch: return Tiles::SWITCH;
+        case TileKind::SwitchWall: return Tiles::SWITCH_WALL_ED;
+        case TileKind::SwitchHazard: return Tiles::SWITCH_HAZARD_ED;
+        }
+        return Tiles::EMPTY;
+    }
+
+    char displayChar() const { return gameDisplayChar(true); }
 
     static CellInstance fromLegacyChar(char ch) {
         CellInstance c;
@@ -105,6 +143,19 @@ struct CellInstance {
         case Tiles::HAZARD:
             c.kind = TileKind::DamagingFloor;
             c.hazardType = "spikes";
+            break;
+        case Tiles::SWITCH:
+            c.kind = TileKind::Switch;
+            c.switchSignal = 0;
+            break;
+        case Tiles::SWITCH_WALL_ED:
+            c.kind = TileKind::SwitchWall;
+            c.switchSignal = 0;
+            break;
+        case Tiles::SWITCH_HAZARD_ED:
+            c.kind = TileKind::SwitchHazard;
+            c.hazardType = "spikes";
+            c.switchSignal = 0;
             break;
         default:
             c.kind = TileKind::Empty;
@@ -219,7 +270,7 @@ public:
 
     char getCell(int row, int col) const {
         if (!isInBounds(row, col)) return Tiles::WALL;
-        return cells[row][col].displayChar();
+        return cells[row][col].editorDisplayChar();
     }
 
     const CellInstance& getCellData(int row, int col) const {
@@ -285,6 +336,13 @@ class Game {
 public:
     explicit Game(Dungeon dungeon) : dungeon_(std::move(dungeon)), result_(GameResult::InProgress) {}
 
+    /** When true, switch walls block and switch hazards deal damage for that signal id. Default true. */
+    bool isSignalPowered(int signalId) const {
+        auto it = switchPowered_.find(signalId);
+        if (it == switchPowered_.end()) return true;
+        return it->second;
+    }
+
     void display() const {
         const int rows = dungeon_.getRows();
         const int cols = dungeon_.getCols();
@@ -295,8 +353,10 @@ public:
             for (int c = 0; c < cols; c++) {
                 if (r == playerRow && c == playerCol)
                     std::cout << Tiles::PLAYER;
-                else
-                    std::cout << dungeon_.getCell(r, c);
+                else {
+                    const CellInstance& cell = dungeon_.getCellData(r, c);
+                    std::cout << cell.gameDisplayChar(isSignalPowered(cell.switchSignal));
+                }
             }
             std::cout << '\n';
         }
@@ -329,7 +389,7 @@ public:
             return;
         }
         std::cout << "Square (" << row1 << ", " << col1 << "):\n";
-        describeCell(dungeon_.getCellData(r, c));
+        describeCellInGame(dungeon_.getCellData(r, c));
     }
 
     GameResult getResult() const { return result_; }
@@ -390,6 +450,33 @@ public:
             std::cout << "  Damaging floor type: " << cell.hazardType
                 << ", damage per step: " << hazardDamageForType(cell.hazardType) << ".\n";
             break;
+        case TileKind::Switch:
+            std::cout << "  Switch (signal " << cell.switchSignal
+                << "). Step on it to toggle all walls/hazards with that signal.\n";
+            break;
+        case TileKind::SwitchWall:
+            std::cout << "  Switch-controlled wall (signal " << cell.switchSignal
+                << "). When active, blocks like a wall; when inactive, walkable (tile stays).\n";
+            break;
+        case TileKind::SwitchHazard:
+            std::cout << "  Switch-controlled damaging floor (signal " << cell.switchSignal
+                << "), type \"" << cell.hazardType << "\" ("
+                << hazardDamageForType(cell.hazardType) << " dmg/step when active).\n";
+            break;
+        }
+    }
+
+    void describeCellInGame(const CellInstance& cell) const {
+        describeCell(cell);
+        if (cell.kind == TileKind::SwitchWall || cell.kind == TileKind::SwitchHazard) {
+            bool on = isSignalPowered(cell.switchSignal);
+            std::cout << "  Current signal " << cell.switchSignal << " state: "
+                << (on ? "ACTIVE (solid / damaging)." : "INACTIVE (open / safe).") << '\n';
+        }
+        if (cell.kind == TileKind::Switch) {
+            bool on = isSignalPowered(cell.switchSignal);
+            std::cout << "  Linked tiles are currently "
+                << (on ? "ACTIVE." : "INACTIVE.") << '\n';
         }
     }
 
@@ -405,6 +492,16 @@ private:
             here.kind = TileKind::Empty;
         }
     }
+
+    void toggleSwitchSignal(int signalId) {
+        const bool wasPowered = isSignalPowered(signalId);
+        const bool nowPowered = !wasPowered;
+        switchPowered_[signalId] = nowPowered;
+        std::cout << "You flip the switch! Signal " << signalId << " is now "
+            << (nowPowered ? "ACTIVE" : "INACTIVE") << " / linked walls/hazards "
+            << (nowPowered ? "turn on (solid / damaging)." : "turn off (walkable / safe).") << '\n';
+    }
+
     bool runBattle(int enemyHp, int enemyStr, int enemyDef) {
         int eh = enemyHp;
         int playerHealth = player_.getHealth();
@@ -451,6 +548,11 @@ private:
             return false;
         }
 
+        if (cell.kind == TileKind::SwitchWall && isSignalPowered(cell.switchSignal)) {
+            std::cout << "You cannot walk through walls.\n";
+            return false;
+        }
+
         if (cell.kind == TileKind::Door) {
             std::string need = cell.lockType.empty() ? std::string("default") : cell.lockType;
             if (!player_.useKey(need)) {
@@ -466,7 +568,32 @@ private:
             return true;
         }
 
-        if (cell.kind == TileKind::Empty) {
+        if (cell.kind == TileKind::Switch) {
+            toggleSwitchSignal(cell.switchSignal);
+            std::cout << "You move onto the switch.\n";
+            clearPlayerSpawnAt(oldRow, oldCol);
+            dungeon_.setPlayerPosition(newRow, newCol);
+            return true;
+        }
+
+        if (cell.kind == TileKind::SwitchHazard && isSignalPowered(cell.switchSignal)) {
+            int dmg = hazardDamageForType(cell.hazardType);
+            std::cout << "You step on " << cell.hazardType << " for " << dmg << " damage!\n";
+            player_.addHealth(-dmg);
+            if (!player_.isAlive()) {
+                result_ = GameResult::GameOver;
+                std::cout << "You have been defeated. Game Over.\n";
+                return true;
+            }
+            clearPlayerSpawnAt(oldRow, oldCol);
+            dungeon_.setPlayerPosition(newRow, newCol);
+            return true;
+        }
+
+        if (cell.kind == TileKind::Empty
+            || cell.kind == TileKind::PlayerSpawn
+            || (cell.kind == TileKind::SwitchWall && !isSignalPowered(cell.switchSignal))
+            || (cell.kind == TileKind::SwitchHazard && !isSignalPowered(cell.switchSignal))) {
             std::cout << "You move forward.\n";
             clearPlayerSpawnAt(oldRow, oldCol);
             dungeon_.setPlayerPosition(newRow, newCol);
@@ -551,14 +678,7 @@ private:
         if (cell.kind == TileKind::Goal) {
             result_ = GameResult::Victory;
             std::cout << "You reached the goal! Victory!\n";
-			clearPlayerSpawnAt(oldRow, oldCol);
-            dungeon_.setPlayerPosition(newRow, newCol);
-            return true;
-        }
-
-        if (cell.kind == TileKind::PlayerSpawn) {
-            std::cout << "You move forward.\n";
-			clearPlayerSpawnAt(oldRow, oldCol);
+            clearPlayerSpawnAt(oldRow, oldCol);
             dungeon_.setPlayerPosition(newRow, newCol);
             return true;
         }
@@ -569,6 +689,8 @@ private:
     Dungeon dungeon_;
     Player player_;
     GameResult result_;
+    /** true => linked walls block and hazards deal damage; false => they behave as empty floor. */
+    std::map<int, bool> switchPowered_;
 };
 
 // ---------------------------------------------------------------------------
@@ -595,6 +717,12 @@ static std::string readLine() {
     std::string line;
     std::getline(std::cin, line);
     return line;
+}
+
+/** Pause x milliseconds between autoplay moves (use this where a course asks for sleep(x) in ms). */
+static void sleepMilliseconds(int x) {
+    if (x < 0) x = 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(x));
 }
 
 // ---------------------------------------------------------------------------
@@ -729,7 +857,7 @@ private:
         std::cout << "Select object (number or name):\n"
             << " 1) Empty   2) Wall   3) Player start   4) Goal   5) Key\n"
             << " 6) Door    7) Enemy  8) Health potion  9) Strength potion\n"
-            << " 10) Defense potion   11) Damaging floor\n"
+            << " 10) Defense potion   11) Damaging floor   12) Switch (+ link tiles)\n"
             << "Choice: ";
         std::string line = readLine();
         std::string s = toLowerToken(collapseSpaces(line));
@@ -746,6 +874,7 @@ private:
         if (s == "9" || s == "strength" || s == "str" || s == "strengthpotion") return 9;
         if (s == "10" || s == "defense" || s == "def" || s == "defensepotion") return 10;
         if (s == "11" || s == "hazard" || s == "damaging" || s == "damagingfloor" || s == "floor") return 11;
+        if (s == "12" || s == "switch") return 12;
         return -1;
     }
 
@@ -869,8 +998,119 @@ private:
         Game::describeCell(dungeon.getCellData(r, c));
     }
 
+    void placeSwitchAndLinkedTiles(Dungeon& dungeon) {
+        displayEditorGrid(dungeon);
+        std::cout << "Place switch: enter row and column (1-based): ";
+        std::string line = readLine();
+        int row = 0, col = 0;
+        if (!parseCoordinates(line, dungeon.getRows(), dungeon.getCols(), row, col)) {
+            std::cout << "Invalid coordinates.\n";
+            return;
+        }
+        const int signalId = readIntLine("Signal index for this switch (from 0 to 99, shared by linked tiles): ", 0, 99);
+        CellInstance sw;
+        sw.kind = TileKind::Switch;
+        sw.switchSignal = signalId;
+        dungeon.setCellData(row, col, sw);
+        std::cout << "Switch (signal " << signalId << ") placed. Add linked walls/floors, or type \"done\" when finished.\n";
+
+        while (true) {
+            std::cout << "\n+Link tiles to signal " << signalId << " +\n"
+                << " 1) Add switch-controlled wall   2) Add switch-controlled damaging floor\n"
+                << " 3) Link existing wall or damaging floor at a cell   4) Done (finished linking)\n"
+                << "Choice (number or add / hazard / link / done): ";
+            std::string choiceLine = readLine();
+            std::string ch = toLowerToken(collapseSpaces(choiceLine));
+
+            if (ch == "4" || ch == "done" || ch == "finish" || ch == "finished" || ch == "stop")
+                break;
+
+            if (ch == "1" || ch == "add" || ch == "wall") {
+                displayEditorGrid(dungeon);
+                std::cout << "Switch-wall cell (row col), or 'back' to cancel: ";
+                std::string coord = readLine();
+                if (toLowerToken(collapseSpaces(coord)) == "back") continue;
+                int r = 0, c = 0;
+                if (!parseCoordinates(coord, dungeon.getRows(), dungeon.getCols(), r, c)) {
+                    std::cout << "Invalid coordinates.\n";
+                    continue;
+                }
+                CellInstance w;
+                w.kind = TileKind::SwitchWall;
+                w.switchSignal = signalId;
+                dungeon.setCellData(r, c, w);
+                std::cout << "Switch-controlled wall linked (signal " << signalId << ").\n";
+                continue;
+            }
+
+            if (ch == "2" || ch == "hazard" || ch == "floor") {
+                displayEditorGrid(dungeon);
+                std::cout << "Switch-hazard cell (row col), or 'back': ";
+                std::string coord = readLine();
+                if (toLowerToken(collapseSpaces(coord)) == "back") continue;
+                int r = 0, c = 0;
+                if (!parseCoordinates(coord, dungeon.getRows(), dungeon.getCols(), r, c)) {
+                    std::cout << "Invalid coordinates.\n";
+                    continue;
+                }
+                CellInstance h;
+                h.kind = TileKind::SwitchHazard;
+                h.switchSignal = signalId;
+                h.hazardType = promptHazardTypeMenu();
+                dungeon.setCellData(r, c, h);
+                std::cout << "Switch-controlled damaging floor linked (signal " << signalId << ").\n";
+                continue;
+            }
+
+            if (ch == "3" || ch == "link") {
+                displayEditorGrid(dungeon);
+                std::cout << "Cell to re-link (row col). Must be = / 'wall' or % / 'hazard";
+                std::string coord = readLine();
+                if (toLowerToken(collapseSpaces(coord)) == "back") continue;
+                int r = 0, c = 0;
+                if (!parseCoordinates(coord, dungeon.getRows(), dungeon.getCols(), r, c)) {
+                    std::cout << "Invalid coordinates.\n";
+                    continue;
+                }
+                CellInstance cur = dungeon.getCellData(r, c);
+                if (cur.kind == TileKind::Wall) {
+                    CellInstance nw;
+                    nw.kind = TileKind::SwitchWall;
+                    nw.switchSignal = signalId;
+                    dungeon.setCellData(r, c, nw);
+                    std::cout << "Normal wall is now switch-controlled (signal " << signalId << ").\n";
+                }
+                else if (cur.kind == TileKind::DamagingFloor) {
+                    CellInstance nh = cur;
+                    nh.kind = TileKind::SwitchHazard;
+                    nh.switchSignal = signalId;
+                    dungeon.setCellData(r, c, nh);
+                    std::cout << "Damaging floor is now switch-controlled (signal " << signalId << ").\n";
+                }
+                else if (cur.kind == TileKind::SwitchWall || cur.kind == TileKind::SwitchHazard) {
+                    cur.switchSignal = signalId;
+                    dungeon.setCellData(r, c, cur);
+                    std::cout << "Updated linked tile to signal " << signalId << ".\n";
+                }
+                else {
+                    std::cout << "That cell is not a wall, damaging floor, or switch-linked tile.\n";
+                }
+                continue;
+            }
+
+            std::cout << "Invalid choice.\n";
+        }
+
+        std::cout << "Finished linking for signal " << signalId << ".\n";
+        displayEditorGrid(dungeon);
+    }
+
     void addObject(Dungeon& dungeon) {
         int choice = objectMenuChoice();
+        if (choice == 12) {
+            placeSwitchAndLinkedTiles(dungeon);
+            return;
+        }
         if (choice < 1 || choice > 11) {
             std::cout << "Invalid choice. Try again.\n";
             return;
@@ -961,6 +1201,8 @@ static void printSymbolLegend() {
         << "  " << Tiles::STRENGTH_POTION << "  Strength potion\n"
         << "  " << Tiles::DEFENSE_POTION << "  Defense potion\n"
         << "  " << Tiles::HAZARD << "  Damaging floor (type/damage vary — inspect)\n"
+        << "  " << Tiles::SWITCH << "  Switch (step on to toggle linked walls/floors by signal index)\n"
+        << "  " << Tiles::WALL << " / " << Tiles::HAZARD << "  When off, linked walls/hazards look like empty floor (inspect for details)\n"
         << "------------------\n\n";
 }
 
@@ -1030,23 +1272,103 @@ static void runGameLoop(Game& game) {
     }
 }
 
+static int getAutoplaySpeedMs() {
+    while (true) {
+        std::cout << "\nAutoplay speed: delay between moves (milliseconds):\n"
+            << " 1) Slow (750 ms)   2) Normal (350 ms)   3) Fast (120 ms)\n"
+            << " 4) Custom — type your own delay in ms\n"
+            << "Choice (number or slow / normal / fast / custom): ";
+        std::string line = readLine();
+        std::string t = toLowerToken(collapseSpaces(line));
+
+        if (t == "1" || t == "slow") return 750;
+        if (t == "2" || t == "normal") return 350;
+        if (t == "3" || t == "fast") return 120;
+        if (t == "4" || t == "custom") {
+            while (true) {
+                std::cout << "Enter delay in milliseconds (0–60000): ";
+                std::string s = readLine();
+                std::istringstream iss(s);
+                int ms = 0;
+                if (iss >> ms && ms >= 0 && ms <= 60000)
+                    return ms;
+                std::cout << "Invalid. Enter an integer from 0 to 60000.\n";
+            }
+        }
+        std::cout << "Invalid choice. Pick 1–4 or a keyword.\n";
+    }
+}
+
+static void runAutoplayLoop(const Dungeon& blueprint, int delayMs) {
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> pickDir(0, 3);
+    static const char* kMoves[] = { "w", "s", "a", "d" };
+    bool firstRun = true;
+
+    while (true) {
+        Game game(blueprint.cloneForPlay());
+        if (firstRun) {
+            printSymbolLegend();
+            firstRun = false;
+        }
+        std::cout << "Autoplay — random moves every " << delayMs << " ms. (No victory guaranteed!)\n";
+
+        while (game.getResult() == GameResult::InProgress) {
+            game.display();
+            std::cout << std::flush;
+            sleepMilliseconds(delayMs);
+            game.processMove(kMoves[pickDir(rng)]);
+        }
+
+        game.display();
+        std::cout << std::flush;
+
+        if (game.getResult() == GameResult::Victory) {
+            std::cout << "Autoplay finished: victory.\n";
+            break;
+        }
+
+        if (game.getResult() == GameResult::GameOver) {
+            std::cout << "Autoplay finished: game over.\n";
+            while (true) {
+                std::cout << "Restart autoplay on this dungeon with the same speed? (y/n): ";
+                std::string ans = readLine();
+                std::string a = toLowerToken(collapseSpaces(ans));
+                if (a == "y" || a == "yes" || a == "restart" || a == "retry") {
+                    break;  // inner while (true) -> new Game from blueprint
+                }
+                if (a == "n" || a == "no" || a == "quit" || a == "menu") {
+                    return;
+                }
+                std::cout << "Please answer y or n.\n";
+            }
+            continue;
+        }
+
+        break;
+    }
+}
+
 static int getMainMenuChoice() {
     while (true) {
         std::cout << "\nMain menu (number or keyword):\n"
             << " 1) Enter a dungeon  (play / enter / dungeon)\n"
-            << " 2) Design a dungeon  (design / editor)\n"
-            << " 3) Exit\n"
+            << " 2) Autoplay a dungeon  (autoplay / auto)\n"
+            << " 3) Design a dungeon  (design / editor)\n"
+            << " 4) Exit\n"
             << "Choice: ";
         std::string line = readLine();
         std::string t = toLowerToken(collapseSpaces(line));
 
         if (t == "1" || t == "play" || t == "enter" || t == "dungeon" || t == "start")
             return 1;
-        if (t == "2" || t == "design" || t == "editor" || t == "build")
+        if (t == "2" || t == "autoplay" || t == "auto")
             return 2;
-        if (t == "3" || t == "exit" || t == "quit" || t == "q")
+        if (t == "3" || t == "design" || t == "editor" || t == "build")
             return 3;
-        std::cout << "Invalid input. Try from 1 to 3 or a keyword like play, editor, exit.\n";
+        if (t == "4" || t == "exit" || t == "quit" || t == "q")
+            return 4;
+        std::cout << "Invalid input. Try 1–4 or a keyword (play, autoplay, editor, exit).\n";
     }
 }
 
@@ -1086,12 +1408,12 @@ int main() {
     while (true) {
         const int menuChoice = getMainMenuChoice();
 
-        if (menuChoice == 3) {
+        if (menuChoice == 4) {
             std::cout << "Thanks for playing!\n";
             break;
         }
 
-        if (menuChoice == 2) {
+        if (menuChoice == 3) {
             editor.run();
             continue;
         }
@@ -1110,12 +1432,21 @@ int main() {
             std::cout << " " << (i + 1) << ") " << allDungeons[i].first << '\n';
 
         const int selectedIndex = getDungeonChoice(allDungeons);
-        Game game(allDungeons[static_cast<size_t>(selectedIndex)].second.cloneForPlay());
-        runGameLoop(game);
+        const Dungeon& chosen = allDungeons[static_cast<size_t>(selectedIndex)].second;
 
-        if (game.getResult() == GameResult::GameOver || game.getResult() == GameResult::Victory
-            || game.getResult() == GameResult::Quit)
+        if (menuChoice == 1) {
+            Game game(chosen.cloneForPlay());
+            runGameLoop(game);
+
+            if (game.getResult() == GameResult::GameOver || game.getResult() == GameResult::Victory
+                || game.getResult() == GameResult::Quit)
+                std::cout << "Returning to main menu.\n";
+        }
+        else if (menuChoice == 2) {
+            const int delayMs = getAutoplaySpeedMs();
+            runAutoplayLoop(chosen, delayMs);
             std::cout << "Returning to main menu.\n";
+        }
     }
 
     return 0;
